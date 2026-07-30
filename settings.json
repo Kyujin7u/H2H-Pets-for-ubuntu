@@ -1,0 +1,73 @@
+{
+  "always_on_top": true,
+  "bubbles_enabled": true,
+  "patrol_mode": false,
+  "active_pet_ids": [
+    "stella"
+  ],
+  "pets": {
+    "carmen": {
+      "display_name": "",
+      "bubble_lines": [],
+      "scale": 0.6,
+      "x": 1840,
+      "y": 960
+    },
+    "jiwoo": {
+      "display_name": "",
+      "bubble_lines": [],
+      "scale": 0.6,
+      "x": null,
+      "y": null
+    },
+    "yuha": {
+      "display_name": "",
+      "bubble_lines": [],
+      "scale": 0.6,
+      "x": null,
+      "y": null
+    },
+    "stella": {
+      "display_name": "",
+      "bubble_lines": [],
+      "scale": 0.6,
+      "x": 1871,
+      "y": 1001
+    },
+    "juun": {
+      "display_name": "",
+      "bubble_lines": [],
+      "scale": 0.6,
+      "x": null,
+      "y": null
+    },
+    "ana": {
+      "display_name": "",
+      "bubble_lines": [],
+      "scale": 0.6,
+      "x": null,
+      "y": null
+    },
+    "ian": {
+      "display_name": "",
+      "bubble_lines": [],
+      "scale": 0.6,
+      "x": null,
+      "y": null
+    },
+    "yeon": {
+      "display_name": "",
+      "bubble_lines": [],
+      "scale": 0.6,
+      "x": null,
+      "y": null
+    },
+    "fans": {
+      "display_name": "",
+      "bubble_lines": [],
+      "scale": 0.6,
+      "x": null,
+      "y": null
+    }
+  }
+}
