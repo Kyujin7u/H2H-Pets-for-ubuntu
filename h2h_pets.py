@@ -11,6 +11,7 @@ import random
 import sys
 import warnings
 import zipfile
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +24,16 @@ gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
 from PIL import Image, ImageDraw, ImageFont
 
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator
+except (ImportError, ValueError):
+    try:
+        gi.require_version("AppIndicator3", "0.1")
+        from gi.repository import AppIndicator3 as AppIndicator
+    except (ImportError, ValueError):
+        AppIndicator = None
+
 warnings.filterwarnings(
     "ignore", category=DeprecationWarning, message=r"Gtk\.StatusIcon\..* is deprecated"
 )
@@ -30,13 +41,29 @@ warnings.filterwarnings(
 
 APP_DIR = Path(__file__).resolve().parent
 ASSET_PATH = APP_DIR / "h2h-pets-assets.pak"
-SETTINGS_PATH = APP_DIR / "settings.json"
-LOCK_PATH = APP_DIR / ".h2h-pets.lock"
+LEGACY_SETTINGS_PATH = APP_DIR / "settings.json"
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+CONFIG_DIR = CONFIG_HOME / "h2h-pets"
+SETTINGS_PATH = CONFIG_DIR / "settings.json"
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR")
+LOCK_PATH = (
+    Path(RUNTIME_DIR) / "h2h-pets.lock"
+    if RUNTIME_DIR
+    else Path("/tmp") / "h2h-pets-{}.lock".format(os.getuid())
+)
 ICON_PATH = APP_DIR / "icon.ico"
 CELL_WIDTH = 192
 CELL_HEIGHT = 208
 MIN_SCALE = 0.25
-MAX_SCALE = 0.60
+DEFAULT_SCALE = 0.60
+MAX_SCALE = 1.00
+MAX_SCENE_CACHE = 16
+PATROL_PROFILES = {
+    "slow": (4500, 8500, 3, 30),
+    "normal": (2800, 6500, 5, 20),
+    "fast": (1800, 4000, 8, 14),
+}
+PATROL_DIRECTIONS = ("random", "left", "right")
 
 
 @dataclass(frozen=True)
@@ -56,6 +83,13 @@ class Pet:
     bubble_lines: tuple
     primary: str
     accent: str
+
+
+@dataclass(frozen=True)
+class RenderedScene:
+    image: object
+    pixbuf: object
+    region: object
 
 
 ACTIONS = (
@@ -88,9 +122,9 @@ def clamp_scale(value):
     try:
         value = float(value)
     except (TypeError, ValueError):
-        return MAX_SCALE
+        return DEFAULT_SCALE
     if not math.isfinite(value):
-        return MAX_SCALE
+        return DEFAULT_SCALE
     return max(MIN_SCALE, min(MAX_SCALE, value))
 
 
@@ -99,6 +133,8 @@ def default_settings():
         "always_on_top": True,
         "bubbles_enabled": True,
         "patrol_mode": False,
+        "patrol_speed": "normal",
+        "patrol_direction": "random",
         "active_pet_ids": ["carmen"],
         "pets": {},
     }
@@ -111,6 +147,10 @@ def normalize_settings(raw):
     for key in ("always_on_top", "bubbles_enabled", "patrol_mode"):
         if isinstance(raw.get(key), bool):
             settings[key] = raw[key]
+    if raw.get("patrol_speed") in PATROL_PROFILES:
+        settings["patrol_speed"] = raw["patrol_speed"]
+    if raw.get("patrol_direction") in PATROL_DIRECTIONS:
+        settings["patrol_direction"] = raw["patrol_direction"]
     active = raw.get("active_pet_ids")
     if isinstance(active, list):
         settings["active_pet_ids"] = []
@@ -125,28 +165,39 @@ def normalize_settings(raw):
             lines = value.get("bubble_lines", [])
             if not isinstance(lines, list):
                 lines = []
+            bubble_enabled = value.get("bubble_enabled", True)
+            if not isinstance(bubble_enabled, bool):
+                bubble_enabled = True
             settings["pets"][pet_id] = {
                 "display_name": str(value.get("display_name", "")).strip(),
                 "bubble_lines": [str(line).strip() for line in lines if str(line).strip()],
-                "scale": clamp_scale(value.get("scale", MAX_SCALE)),
+                "scale": clamp_scale(value.get("scale", DEFAULT_SCALE)),
+                "bubble_enabled": bubble_enabled,
                 "x": value.get("x") if isinstance(value.get("x"), int) else None,
                 "y": value.get("y") if isinstance(value.get("y"), int) else None,
             }
     return settings
 
 
-def load_settings(path=SETTINGS_PATH):
+def load_settings(path=None, legacy_path=None):
+    target = Path(path) if path is not None else SETTINGS_PATH
+    legacy = Path(legacy_path) if legacy_path is not None else LEGACY_SETTINGS_PATH
+    source = target if target.is_file() else legacy
     try:
-        with Path(path).open("r", encoding="utf-8") as handle:
-            return normalize_settings(json.load(handle))
+        with source.open("r", encoding="utf-8") as handle:
+            settings = normalize_settings(json.load(handle))
     except (OSError, ValueError):
         return default_settings()
+    if source == legacy and target != legacy:
+        save_settings(settings, target)
+    return settings
 
 
-def save_settings(settings, path=SETTINGS_PATH):
-    target = Path(path)
+def save_settings(settings, path=None):
+    target = Path(path) if path is not None else SETTINGS_PATH
     temporary = target.with_suffix(target.suffix + ".tmp")
     try:
+        target.parent.mkdir(parents=True, exist_ok=True)
         with temporary.open("w", encoding="utf-8") as handle:
             json.dump(settings, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
@@ -346,9 +397,11 @@ class PetWindow(Gtk.Window):
         self.frame_index = 0
         self.bubble_index = 0
         self.frame_cache = {}
+        self.scene_cache = OrderedDict()
         self.current_frame = None
         self.current_scene = None
         self.current_pixbuf = None
+        self.current_region = None
         self.dragging = False
         self.drag_moved = False
         self.drag_start_pointer = (0, 0)
@@ -490,10 +543,7 @@ class PetWindow(Gtk.Window):
         del widget
         increase = event.direction in (Gdk.ScrollDirection.UP, Gdk.ScrollDirection.RIGHT)
         delta = 0.05 if increase else -0.05
-        self.pet_settings["scale"] = clamp_scale(self.pet_settings["scale"] + delta)
-        self.frame_cache.clear()
-        self._apply_current_frame()
-        self.manager.save()
+        self.set_scale(self.pet_settings["scale"] + delta)
         return True
 
     def _on_key_press(self, widget, event):
@@ -548,6 +598,7 @@ class PetWindow(Gtk.Window):
             self.frame_index = 0
             self._start_frame_timer()
         self._apply_current_frame()
+        self.manager.update_panel_status(self.pet.pet_id)
 
     def _reset_to_idle(self):
         self.reset_source = None
@@ -575,23 +626,55 @@ class PetWindow(Gtk.Window):
             return
         lines = self.manager.bubble_lines(self.pet)
         text = lines[self.bubble_index % len(lines)] if lines else self.manager.display_name(self.pet)
-        self.current_scene = compose_scene(
-            self.current_frame,
-            text,
-            self.pet.accent,
-            self.pet_settings["scale"],
-            self.manager.settings["bubbles_enabled"],
+        bubbles_enabled = (
+            self.manager.settings["bubbles_enabled"]
+            and self.pet_settings.get("bubble_enabled", True)
         )
-        self.current_pixbuf = image_to_pixbuf(self.current_scene)
+        cache_key = (
+            self.action.name,
+            self.frame_index % self.action.frames,
+            text,
+            round(self.pet_settings["scale"], 2),
+            bubbles_enabled,
+        )
+        rendered = self.scene_cache.pop(cache_key, None)
+        if rendered is None:
+            scene = compose_scene(
+                self.current_frame,
+                text,
+                self.pet.accent,
+                self.pet_settings["scale"],
+                bubbles_enabled,
+            )
+            rendered = RenderedScene(scene, image_to_pixbuf(scene), alpha_region(scene))
+            if len(self.scene_cache) >= MAX_SCENE_CACHE:
+                self.scene_cache.popitem(last=False)
+        self.scene_cache[cache_key] = rendered
+        self.current_scene = rendered.image
+        self.current_pixbuf = rendered.pixbuf
+        self.current_region = rendered.region
         self.canvas.set_size_request(self.current_scene.width, self.current_scene.height)
         self.resize(self.current_scene.width, self.current_scene.height)
         self._place_window()
         self.queue_draw()
         gdk_window = self.get_window()
         if gdk_window is not None:
-            region = alpha_region(self.current_scene)
-            gdk_window.shape_combine_region(region, 0, 0)
-            gdk_window.input_shape_combine_region(region, 0, 0)
+            gdk_window.shape_combine_region(self.current_region, 0, 0)
+            gdk_window.input_shape_combine_region(self.current_region, 0, 0)
+
+    def invalidate_scene_cache(self):
+        self.scene_cache.clear()
+
+    def set_scale(self, value):
+        next_scale = clamp_scale(value)
+        if math.isclose(next_scale, self.pet_settings["scale"], abs_tol=0.001):
+            return
+        self.pet_settings["scale"] = next_scale
+        self.frame_cache.clear()
+        self.invalidate_scene_cache()
+        self._apply_current_frame()
+        self.manager.save()
+        self.manager.update_panel_status(self.pet.pet_id)
 
     def _place_window(self):
         if self.current_scene is None:
@@ -618,7 +701,10 @@ class PetWindow(Gtk.Window):
         self._cancel_source("patrol_source")
         if not self.manager.settings["patrol_mode"]:
             return
-        self.patrol_source = GLib.timeout_add(random.randint(2800, 6500), self._begin_patrol)
+        minimum, maximum, unused_step, unused_interval = PATROL_PROFILES[
+            self.manager.settings["patrol_speed"]
+        ]
+        self.patrol_source = GLib.timeout_add(random.randint(minimum, maximum), self._begin_patrol)
 
     def _begin_patrol(self):
         self.patrol_source = None
@@ -626,15 +712,24 @@ class PetWindow(Gtk.Window):
             self._schedule_patrol()
             return False
         work = self.manager.work_area_at(self.bottom_center)
-        direction = random.choice((-1, 1))
+        configured_direction = self.manager.settings["patrol_direction"]
+        if configured_direction == "left":
+            direction = -1
+        elif configured_direction == "right":
+            direction = 1
+        else:
+            direction = random.choice((-1, 1))
         if self.bottom_center[0] < work.x + 120:
             direction = 1
         elif self.bottom_center[0] > work.x + work.width - 120:
             direction = -1
-        self.patrol_step_x = direction * max(1, int(round(5 * self.pet_settings["scale"])))
+        unused_minimum, unused_maximum, step, interval = PATROL_PROFILES[
+            self.manager.settings["patrol_speed"]
+        ]
+        self.patrol_step_x = direction * max(1, int(round(step * self.pet_settings["scale"])))
         self.patrol_steps = random.randint(20, 37)
         self.set_action("running-left" if direction < 0 else "running-right")
-        self.patrol_move_source = GLib.timeout_add(20, self._continue_patrol)
+        self.patrol_move_source = GLib.timeout_add(interval, self._continue_patrol)
         return False
 
     def _continue_patrol(self):
@@ -643,6 +738,7 @@ class PetWindow(Gtk.Window):
             self.patrol_steps = 0
             if not self.dragging:
                 self.set_action("idle")
+                self.manager.update_panel_status(self.pet.pet_id)
             self._schedule_patrol()
             return False
         work = self.manager.work_area_at(self.bottom_center)
@@ -670,7 +766,7 @@ class ControlPanel(Gtk.Window):
         super().__init__(title="H2H Pets Controls")
         self.manager = manager
         self.rendering = False
-        self.set_default_size(520, 600)
+        self.set_default_size(560, 700)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.connect("delete-event", self._hide_panel)
 
@@ -693,6 +789,13 @@ class ControlPanel(Gtk.Window):
         self.pet_combo.connect("changed", self._render_editor)
         root.pack_start(self.pet_combo, False, False, 0)
 
+        status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        self.action_status = Gtk.Label(label="Action: Hidden", xalign=0)
+        self.position_status = Gtk.Label(label="Position: Not set", xalign=0)
+        status_box.pack_start(self.action_status, True, True, 0)
+        status_box.pack_start(self.position_status, True, True, 0)
+        root.pack_start(status_box, False, False, 0)
+
         self.name_entry = Gtk.Entry()
         self.name_entry.set_placeholder_text("Display name")
         root.pack_start(self.name_entry, False, False, 0)
@@ -702,6 +805,25 @@ class ControlPanel(Gtk.Window):
         self.bubble_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         bubble_scroll.add(self.bubble_view)
         root.pack_start(bubble_scroll, True, True, 0)
+
+        size_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        size_box.pack_start(Gtk.Label(label="Size", xalign=0), False, False, 0)
+        self.size_scale = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, MIN_SCALE * 100, MAX_SCALE * 100, 5
+        )
+        self.size_scale.set_digits(0)
+        self.size_scale.set_value_pos(Gtk.PositionType.RIGHT)
+        self.size_scale.set_hexpand(True)
+        self.size_scale.connect("value-changed", self._change_size)
+        size_box.pack_start(self.size_scale, True, True, 0)
+        reset_size = Gtk.Button(label="Default Size")
+        reset_size.connect("clicked", self._reset_size)
+        size_box.pack_start(reset_size, False, False, 0)
+        root.pack_start(size_box, False, False, 0)
+
+        self.pet_bubble_toggle = Gtk.CheckButton(label="Bubble for this pet")
+        self.pet_bubble_toggle.connect("toggled", self._toggle_pet_bubble)
+        root.pack_start(self.pet_bubble_toggle, False, False, 0)
 
         self.action_box = Gtk.FlowBox()
         self.action_box.set_selection_mode(Gtk.SelectionMode.NONE)
@@ -722,6 +844,23 @@ class ControlPanel(Gtk.Window):
         for toggle in (self.bubbles_toggle, self.top_toggle, self.patrol_toggle):
             toggles.pack_start(toggle, False, False, 0)
         root.pack_start(toggles, False, False, 0)
+
+        patrol_options = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        patrol_options.pack_start(Gtk.Label(label="Patrol Speed", xalign=0), False, False, 0)
+        self.patrol_speed = Gtk.ComboBoxText()
+        self.patrol_speed.append("slow", "Slow")
+        self.patrol_speed.append("normal", "Normal")
+        self.patrol_speed.append("fast", "Fast")
+        self.patrol_speed.connect("changed", self._change_patrol_speed)
+        patrol_options.pack_start(self.patrol_speed, False, False, 0)
+        patrol_options.pack_start(Gtk.Label(label="Direction", xalign=0), False, False, 0)
+        self.patrol_direction = Gtk.ComboBoxText()
+        self.patrol_direction.append("random", "Random")
+        self.patrol_direction.append("left", "Left")
+        self.patrol_direction.append("right", "Right")
+        self.patrol_direction.connect("changed", self._change_patrol_direction)
+        patrol_options.pack_start(self.patrol_direction, False, False, 0)
+        root.pack_start(patrol_options, False, False, 0)
 
         buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         save_button = Gtk.Button(label="Save Pet Text")
@@ -756,6 +895,8 @@ class ControlPanel(Gtk.Window):
         self.bubbles_toggle.set_active(self.manager.settings["bubbles_enabled"])
         self.top_toggle.set_active(self.manager.settings["always_on_top"])
         self.patrol_toggle.set_active(self.manager.settings["patrol_mode"])
+        self.patrol_speed.set_active_id(self.manager.settings["patrol_speed"])
+        self.patrol_direction.set_active_id(self.manager.settings["patrol_direction"])
         self.rendering = False
         self._render_editor()
         self.show_all()
@@ -769,9 +910,23 @@ class ControlPanel(Gtk.Window):
         pet = self._selected_pet()
         if pet is None:
             return
+        self.rendering = True
         self.name_entry.set_text(self.manager.display_name(pet))
         buffer_ = self.bubble_view.get_buffer()
         buffer_.set_text("\n".join(self.manager.bubble_lines(pet)))
+        settings = self.manager.pet_settings(pet.pet_id)
+        self.size_scale.set_value(settings["scale"] * 100)
+        self.pet_bubble_toggle.set_active(settings.get("bubble_enabled", True))
+        self.rendering = False
+        self.update_status(pet.pet_id)
+
+    def update_status(self, pet_id):
+        pet = self._selected_pet()
+        if pet is None or pet.pet_id != pet_id:
+            return
+        action, position = self.manager.pet_status(pet_id)
+        self.action_status.set_text("Action: {}".format(action))
+        self.position_status.set_text("Position: {}".format(position))
 
     def _toggle_pet(self, toggle, pet_id):
         if self.rendering:
@@ -787,6 +942,31 @@ class ControlPanel(Gtk.Window):
         pet = self._selected_pet()
         if pet is not None:
             self.manager.set_pet_action(pet.pet_id, action_name)
+            self.update_status(pet.pet_id)
+
+    def _change_size(self, scale):
+        if self.rendering:
+            return
+        pet = self._selected_pet()
+        if pet is not None:
+            self.manager.set_pet_scale(pet.pet_id, scale.get_value() / 100.0)
+
+    def _reset_size(self, button):
+        del button
+        pet = self._selected_pet()
+        if pet is None:
+            return
+        self.manager.set_pet_scale(pet.pet_id, DEFAULT_SCALE)
+        self.rendering = True
+        self.size_scale.set_value(DEFAULT_SCALE * 100)
+        self.rendering = False
+
+    def _toggle_pet_bubble(self, toggle):
+        if self.rendering:
+            return
+        pet = self._selected_pet()
+        if pet is not None:
+            self.manager.set_pet_bubble_enabled(pet.pet_id, toggle.get_active())
 
     def _toggle_bubbles(self, toggle):
         if not self.rendering:
@@ -799,6 +979,14 @@ class ControlPanel(Gtk.Window):
     def _toggle_patrol(self, toggle):
         if not self.rendering:
             self.manager.set_patrol_mode(toggle.get_active())
+
+    def _change_patrol_speed(self, combo):
+        if not self.rendering and combo.get_active_id():
+            self.manager.set_patrol_speed(combo.get_active_id())
+
+    def _change_patrol_direction(self, combo):
+        if not self.rendering and combo.get_active_id():
+            self.manager.set_patrol_direction(combo.get_active_id())
 
     def _save_pet_text(self, button):
         del button
@@ -823,6 +1011,7 @@ class PetManager:
         self.windows = {}
         self.panel = None
         self.status_icon = None
+        self.indicator = None
         self.duration = max(0, int(duration))
         self.lock_handle = None
 
@@ -854,11 +1043,13 @@ class PetManager:
             pets[pet_id] = {
                 "display_name": "",
                 "bubble_lines": [],
-                "scale": MAX_SCALE,
+                "scale": DEFAULT_SCALE,
+                "bubble_enabled": True,
                 "x": None,
                 "y": None,
             }
-        pets[pet_id]["scale"] = clamp_scale(pets[pet_id].get("scale", MAX_SCALE))
+        pets[pet_id]["scale"] = clamp_scale(pets[pet_id].get("scale", DEFAULT_SCALE))
+        pets[pet_id]["bubble_enabled"] = pets[pet_id].get("bubble_enabled", True) is not False
         return pets[pet_id]
 
     def display_name(self, pet):
@@ -883,6 +1074,7 @@ class PetManager:
         self.windows[pet_id] = window
         window.start()
         self.save()
+        self._refresh_indicator_menu()
 
     def hide_pet(self, pet_id):
         if pet_id in self.settings["active_pet_ids"]:
@@ -891,6 +1083,7 @@ class PetManager:
         if window is not None:
             window.stop()
         self.save()
+        self._refresh_indicator_menu()
 
     def show_all(self):
         for pet in PETS:
@@ -908,19 +1101,59 @@ class PetManager:
     def set_bubbles_enabled(self, enabled):
         self.settings["bubbles_enabled"] = bool(enabled)
         for window in self.windows.values():
+            window.invalidate_scene_cache()
             window.refresh_scene()
         self.save()
+        self._refresh_indicator_menu()
 
     def set_always_on_top(self, enabled):
         self.settings["always_on_top"] = bool(enabled)
         for window in self.windows.values():
             window.set_keep_above(bool(enabled))
         self.save()
+        self._refresh_indicator_menu()
 
     def set_patrol_mode(self, enabled):
         self.settings["patrol_mode"] = bool(enabled)
         for window in self.windows.values():
             window.apply_patrol_mode()
+        self.save()
+        self._refresh_indicator_menu()
+
+    def set_patrol_speed(self, speed):
+        if speed not in PATROL_PROFILES:
+            return
+        self.settings["patrol_speed"] = speed
+        for window in self.windows.values():
+            window.apply_patrol_mode()
+        self.save()
+
+    def set_patrol_direction(self, direction):
+        if direction not in PATROL_DIRECTIONS:
+            return
+        self.settings["patrol_direction"] = direction
+        for window in self.windows.values():
+            window.apply_patrol_mode()
+        self.save()
+
+    def set_pet_scale(self, pet_id, scale):
+        settings = self.pet_settings(pet_id)
+        value = clamp_scale(scale)
+        window = self.windows.get(pet_id)
+        if window is not None:
+            window.set_scale(value)
+        else:
+            settings["scale"] = value
+            self.save()
+        self.update_panel_status(pet_id)
+
+    def set_pet_bubble_enabled(self, pet_id, enabled):
+        settings = self.pet_settings(pet_id)
+        settings["bubble_enabled"] = bool(enabled)
+        window = self.windows.get(pet_id)
+        if window is not None:
+            window.invalidate_scene_cache()
+            window.refresh_scene()
         self.save()
 
     def save_pet_text(self, pet_id, display_name, lines):
@@ -930,8 +1163,25 @@ class PetManager:
         window = self.windows.get(pet_id)
         if window is not None:
             window.bubble_index = 0
+            window.invalidate_scene_cache()
             window.refresh_scene()
         self.save()
+
+    def pet_status(self, pet_id):
+        window = self.windows.get(pet_id)
+        settings = self.pet_settings(pet_id)
+        if window is None:
+            action = "Hidden"
+            x, y = settings.get("x"), settings.get("y")
+        else:
+            action = window.action.label
+            x, y = window.bottom_center
+        position = "Not set" if x is None or y is None else "{}, {}".format(x, y)
+        return action, position
+
+    def update_panel_status(self, pet_id):
+        if self.panel is not None and self.panel.get_visible():
+            self.panel.update_status(pet_id)
 
     def default_bottom_center(self, index):
         work = self.primary_work_area()
@@ -960,6 +1210,7 @@ class PetManager:
             if window is not None:
                 window.bottom_center = position
                 window._place_window()
+            self.update_panel_status(pet.pet_id)
         self.save()
 
     def open_control_panel(self, selected_pet_id=None):
@@ -972,6 +1223,19 @@ class PetManager:
         save_settings(self.settings)
 
     def _create_status_icon(self):
+        if AppIndicator is not None:
+            try:
+                self.indicator = AppIndicator.Indicator.new(
+                    "h2h-pets",
+                    str(ICON_PATH) if ICON_PATH.is_file() else "applications-games",
+                    AppIndicator.IndicatorCategory.APPLICATION_STATUS,
+                )
+                self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+                self._refresh_indicator_menu()
+                return
+            except Exception as error:
+                self.indicator = None
+                print("AppIndicator unavailable, using GTK tray: {}".format(error), file=sys.stderr)
         if not hasattr(Gtk, "StatusIcon"):
             return
         if ICON_PATH.is_file():
@@ -984,6 +1248,10 @@ class PetManager:
         self.status_icon.connect("popup-menu", self._popup_status_menu)
 
     def _popup_status_menu(self, status_icon, button, activate_time):
+        menu = self._build_tray_menu()
+        menu.popup(None, None, Gtk.StatusIcon.position_menu, status_icon, button, activate_time)
+
+    def _build_tray_menu(self):
         menu = Gtk.Menu()
         self._menu_item(menu, "Control Panel", lambda unused: self.open_control_panel())
         self._menu_item(menu, "Show All Pets", lambda unused: self.show_all())
@@ -1002,7 +1270,11 @@ class PetManager:
         menu.append(Gtk.SeparatorMenuItem())
         self._menu_item(menu, "Quit", lambda unused: self.quit())
         menu.show_all()
-        menu.popup(None, None, Gtk.StatusIcon.position_menu, status_icon, button, activate_time)
+        return menu
+
+    def _refresh_indicator_menu(self):
+        if self.indicator is not None:
+            self.indicator.set_menu(self._build_tray_menu())
 
     def _menu_item(self, menu, label, callback):
         item = Gtk.MenuItem(label=label)
@@ -1031,6 +1303,8 @@ class PetManager:
             self.panel = None
         if self.status_icon is not None:
             self.status_icon.set_visible(False)
+        if self.indicator is not None:
+            self.indicator.set_status(AppIndicator.IndicatorStatus.PASSIVE)
         Gtk.main_quit()
 
 
@@ -1041,7 +1315,28 @@ def check_installation():
         sheet = store.load_sheet(pet)
         if sheet.size != (1536, 1872):
             raise ValueError("Invalid sheet for {}".format(pet.pet_id))
-    print("H2H Pets check passed: 9 pets, 9 actions, GTK3 available")
+    tray = "AppIndicator" if AppIndicator is not None else "GTK StatusIcon fallback"
+    print("H2H Pets check passed: 9 pets, 9 actions, GTK3 available, {}".format(tray))
+
+
+def show_error(message, title="H2H Pets"):
+    print("{}: {}".format(title, message), file=sys.stderr)
+    try:
+        initialized, unused_argv = Gtk.init_check([])
+        if not initialized:
+            return
+        dialog = Gtk.MessageDialog(
+            transient_for=None,
+            flags=Gtk.DialogFlags.MODAL,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.CLOSE,
+            text=title,
+        )
+        dialog.format_secondary_text(str(message))
+        dialog.run()
+        dialog.destroy()
+    except Exception:
+        pass
 
 
 def parse_args(argv):
@@ -1057,11 +1352,14 @@ def main(argv=None):
     if args.check:
         check_installation()
         return 0
+    initialized, unused_argv = Gtk.init_check([])
+    if not initialized:
+        raise RuntimeError("Cannot connect to the graphical desktop. Check DISPLAY and XAUTHORITY.")
     if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland":
         print("Warning: Wayland may restrict pet movement and always-on-top behavior.", file=sys.stderr)
     manager = PetManager(show_all=args.show_all, duration=args.duration)
     if not manager.acquire_lock():
-        print("H2H Pets is already running.", file=sys.stderr)
+        show_error("H2H Pets is already running.")
         return 1
     manager.start()
     try:
@@ -1075,5 +1373,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as error:
-        print("H2H Pets failed to start: {}".format(error), file=sys.stderr)
+        show_error(str(error), "H2H Pets failed to start")
         sys.exit(1)
