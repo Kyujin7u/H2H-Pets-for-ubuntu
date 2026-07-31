@@ -57,6 +57,11 @@ position reset. Settings are stored in `~/.config/h2h-pets/settings.json` (or
 under `$XDG_CONFIG_HOME` when set). Existing settings next to the application
 are migrated automatically. The instance lock is stored in `$XDG_RUNTIME_DIR`.
 
+Patrol mode moves each pet independently in both horizontal and vertical
+directions while keeping its full window inside the current monitor. Between
+movements, pets choose a random ambient action. The Left and Right direction
+options control the horizontal preference; vertical movement remains random.
+
 ## Platform notes
 
 Ubuntu 20.04 already provides the required Python 3, GTK3, Cairo, and Pillow

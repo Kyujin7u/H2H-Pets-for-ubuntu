@@ -103,6 +103,15 @@ ACTIONS = (
     Action("running", "Busy", 7, 6, 8),
     Action("review", "Review", 8, 6, 5),
 )
+PATROL_AMBIENT_ACTIONS = (
+    "idle",
+    "waving",
+    "jumping",
+    "failed",
+    "waiting",
+    "running",
+    "review",
+)
 
 PETS = (
     Pet("carmen", "bingping", "carmen\\final\\spritesheet.png", ("bingping is running!",), "#eef8ff", "#3b91c9"),
@@ -412,7 +421,10 @@ class PetWindow(Gtk.Window):
         self.patrol_source = None
         self.patrol_move_source = None
         self.patrol_steps = 0
-        self.patrol_step_x = 0
+        self.patrol_step_x = 0.0
+        self.patrol_step_y = 0.0
+        self.patrol_position_x = 0.0
+        self.patrol_position_y = 0.0
 
         saved_x = self.pet_settings.get("x")
         saved_y = self.pet_settings.get("y")
@@ -504,7 +516,9 @@ class PetWindow(Gtk.Window):
         self.dragging = True
         self.drag_moved = False
         self._cancel_source("reset_source")
+        self._cancel_source("patrol_source")
         self._cancel_source("patrol_move_source")
+        self.patrol_steps = 0
         self.drag_start_pointer = (int(event.x_root), int(event.y_root))
         self.drag_start_center = self.bottom_center
         return True
@@ -533,8 +547,10 @@ class PetWindow(Gtk.Window):
         self.dragging = False
         self.manager.save()
         if self.drag_moved:
-            self.set_action("idle")
-            self._schedule_patrol()
+            if self.manager.settings["patrol_mode"]:
+                self._enter_patrol_rest()
+            else:
+                self.set_action("idle")
         else:
             self.activate_action("jumping")
         return True
@@ -603,7 +619,10 @@ class PetWindow(Gtk.Window):
     def _reset_to_idle(self):
         self.reset_source = None
         if not self.dragging and self.patrol_steps <= 0:
-            self.set_action("idle")
+            if self.manager.settings["patrol_mode"]:
+                self._enter_patrol_rest()
+            else:
+                self.set_action("idle")
         return False
 
     def _frames(self):
@@ -693,9 +712,43 @@ class PetWindow(Gtk.Window):
         self._cancel_source("patrol_move_source")
         self.patrol_steps = 0
         if self.manager.settings["patrol_mode"]:
-            self._schedule_patrol()
+            self._enter_patrol_rest()
         elif not self.dragging:
             self.set_action("idle")
+
+    def _enter_patrol_rest(self):
+        if not self.manager.settings["patrol_mode"] or self.dragging:
+            return
+        choices = [name for name in PATROL_AMBIENT_ACTIONS if name != self.action.name]
+        self.set_action(random.choice(choices or PATROL_AMBIENT_ACTIONS))
+        work = self.manager.work_area_at(self.bottom_center)
+        left, right, top, bottom = self._patrol_bounds(work)
+        self.bottom_center = (
+            int(round(max(left, min(right, self.bottom_center[0])))),
+            int(round(max(top, min(bottom, self.bottom_center[1])))),
+        )
+        self._store_position()
+        self._place_window()
+        self._schedule_patrol()
+
+    def _patrol_bounds(self, work):
+        width = self.current_scene.width if self.current_scene is not None else 1
+        height = self.current_scene.height if self.current_scene is not None else 1
+        padding = 8
+        left = work.x + width // 2 + padding
+        right = work.x + work.width - (width - width // 2) - padding
+        jump_height = (
+            max(1, round(32 * self.pet_settings["scale"]))
+            if self.action.name == "jumping"
+            else 0
+        )
+        top = work.y + height + jump_height + padding
+        bottom = work.y + work.height - padding
+        if left > right:
+            left = right = work.x + work.width / 2
+        if top > bottom:
+            top = bottom = work.y + work.height - padding
+        return float(left), float(right), float(top), float(bottom)
 
     def _schedule_patrol(self):
         self._cancel_source("patrol_source")
@@ -708,7 +761,7 @@ class PetWindow(Gtk.Window):
 
     def _begin_patrol(self):
         self.patrol_source = None
-        if not self.manager.settings["patrol_mode"] or self.dragging or self.action.name != "idle":
+        if not self.manager.settings["patrol_mode"] or self.dragging:
             self._schedule_patrol()
             return False
         work = self.manager.work_area_at(self.bottom_center)
@@ -723,10 +776,21 @@ class PetWindow(Gtk.Window):
             direction = 1
         elif self.bottom_center[0] > work.x + work.width - 120:
             direction = -1
+        vertical_direction = random.choice((-1, 1))
+        if self.bottom_center[1] < work.y + 160:
+            vertical_direction = 1
+        elif self.bottom_center[1] > work.y + work.height - 120:
+            vertical_direction = -1
         unused_minimum, unused_maximum, step, interval = PATROL_PROFILES[
             self.manager.settings["patrol_speed"]
         ]
-        self.patrol_step_x = direction * max(1, int(round(step * self.pet_settings["scale"])))
+        distance = max(1.0, step * self.pet_settings["scale"])
+        vertical_ratio = vertical_direction * random.uniform(0.35, 1.0)
+        magnitude = math.hypot(1.0, vertical_ratio)
+        self.patrol_step_x = direction * distance / magnitude
+        self.patrol_step_y = vertical_ratio * distance / magnitude
+        self.patrol_position_x = float(self.bottom_center[0])
+        self.patrol_position_y = float(self.bottom_center[1])
         self.patrol_steps = random.randint(20, 37)
         self.set_action("running-left" if direction < 0 else "running-right")
         self.patrol_move_source = GLib.timeout_add(interval, self._continue_patrol)
@@ -737,15 +801,25 @@ class PetWindow(Gtk.Window):
             self.patrol_move_source = None
             self.patrol_steps = 0
             if not self.dragging:
-                self.set_action("idle")
-                self.manager.update_panel_status(self.pet.pet_id)
-            self._schedule_patrol()
+                self._enter_patrol_rest()
             return False
         work = self.manager.work_area_at(self.bottom_center)
-        left = work.x + 24
-        right = work.x + work.width - 24
-        next_x = max(left, min(right, self.bottom_center[0] + self.patrol_step_x))
-        self.bottom_center = (next_x, self.bottom_center[1])
+        left, right, top, bottom = self._patrol_bounds(work)
+        next_x = self.patrol_position_x + self.patrol_step_x
+        next_y = self.patrol_position_y + self.patrol_step_y
+        if next_x < left or next_x > right:
+            self.patrol_step_x = -self.patrol_step_x
+            next_x = self.patrol_position_x + self.patrol_step_x
+            self.set_action("running-left" if self.patrol_step_x < 0 else "running-right")
+        if next_y < top or next_y > bottom:
+            self.patrol_step_y = -self.patrol_step_y
+            next_y = self.patrol_position_y + self.patrol_step_y
+        self.patrol_position_x = max(left, min(right, next_x))
+        self.patrol_position_y = max(top, min(bottom, next_y))
+        self.bottom_center = (
+            int(round(self.patrol_position_x)),
+            int(round(self.patrol_position_y)),
+        )
         self.patrol_steps -= 1
         self._store_position()
         self._place_window()
